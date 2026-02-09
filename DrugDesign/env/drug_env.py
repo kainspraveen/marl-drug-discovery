@@ -3,13 +3,25 @@ Multi-agent drug design environment using PettingZoo
 
 """
 import functools
+import sys
+import os
 import random
 from copy import copy
 from pettingzoo import ParallelEnv
 from gymnasium.spaces import Discrete, Box
 import numpy as np
-from rdkit.Chem import Draw, RWMol, MolToSmiles, Atom, Bond, AllChem, rdFingerprintGenerator, MolFromSmiles, Descriptors, Crippen, QED, BondType
+from rdkit import Chem
+from rdkit.Chem import Draw, RWMol, MolToSmiles, Atom, Bond, AllChem, rdFingerprintGenerator, MolFromSmiles, Descriptors, Crippen, QED, BondType, MolFromSmarts
+from rdkit.Chem import FilterCatalog, RDConfig
 from pettingzoo.utils.agent_selector import agent_selector
+from gymnasium.spaces import Discrete, Box, Dict
+
+try:
+    sys.path.append(os.path.join(RDConfig.RDContribDir, 'SA_Score'))
+    import sascorer
+except ImportError:
+    print("Warning: sascorer not found. SA Score will be 1.0 (ignored).")
+    sascorer = None
 
 class DrugDesignEnv(ParallelEnv):
     """
@@ -67,12 +79,35 @@ class DrugDesignEnv(ParallelEnv):
         self.possible_agents = self.agents[:]
         self.agent_name_mapping = dict(zip(self.agents, range(len(self.agents))))
 
+        # === CONSTANTS ===
+        self.MAX_ATOMS = 50
+        self.NUM_ATOM_FEATURES = 12  # 7 (types) + 1 (aromatic) + 4 (hybridization)
+        self.NUM_BOND_FEATURES = 4   # Single, Double, Triple, Aromatic
+
         # Action: 0-10 (add atoms, bonds, etc.)
         self.action_spaces = {agent: Discrete(11) for agent in self.agents}
 
-        #Obeservation: 2048-bit fingerprint
+        # We use a Dictionary space to hold Node features and Edge Indices
         self.observation_spaces = {
-            agent: Box(low=0, high=20, shape=(2048,), dtype=np.float32)
+            agent: Dict({
+                # Node Features: (Max_Atoms, Num_Features)
+                "x": Box(low=0, high=1, shape=(self.MAX_ATOMS, self.NUM_ATOM_FEATURES), dtype=np.float32),
+                
+                # Adjacency Matrix / Edge Index: (2, Max_Edges) 
+                # We allocate space for a fully connected graph as worst case (Max_Atoms * Max_Atoms)
+                # But typically padding with -1 or handle in the 'observe' function
+                "edge_index": Box(low=0, high=self.MAX_ATOMS, shape=(2, self.MAX_ATOMS * 4), dtype=np.int64),
+                
+                # Edge Attributes: (Max_Edges, Num_Bond_Features)
+                "edge_attr": Box(low=0, high=1, shape=(self.MAX_ATOMS * 4, self.NUM_BOND_FEATURES), dtype=np.float32),
+                
+                # Mask: To tell the GNN which nodes are real and which are padding
+                "mask": Box(low=0, high=1, shape=(self.MAX_ATOMS,), dtype=np.int8),
+
+                # Action Mask (1=Valid, 0=Invalid)
+                # Size = 11 (number of actions in your Discrete space)
+                "action_mask": Box(low=0, high=1, shape=(11,), dtype=np.int8),
+            })
             for agent in self.agents
         }
         
@@ -134,38 +169,32 @@ class DrugDesignEnv(ParallelEnv):
         except:
             valid_chemistry = False
 
-        reward = 0
+        reward = 0.0
 
         # Calculate Rewards
         if not valid_chemistry:
-            reward = -10.0 #Penalize heavily for invalid molecules
+            reward = -5.0 #Penalize heavily for invalid molecules
+        elif not self._check_unwanted_substructures(self.mol):
+            reward = -5.0 #Penalize toxic / unstablle substructures
         else: 
-            reward += 1 #Reward for valid chemistry
-        try:
-            # Use continuous values instead of thresholds for faster learning
-            # QED is 0.0 to 1.0 (Higher is better)
+            reward += 0.5 #Reward for valid chemistry
+            
+            # QED (Drug-likeness) [0.0 - 1.0]
             qed_score = QED.qed(self.mol)
-            reward += qed_score * 2.0  # Scale up QED importance
+            reward += qed_score * 2.0 
 
-            # LogP: Target is usually between 0 and 5
-            logp = Crippen.MolLogP(self.mol)
-            if 0 < logp < 5:
-                reward += 1.0
-            else:
-                # Penalize distance from optimal range
-                reward -= 0.1 * min(abs(logp - 0), abs(logp - 5))
+            # SA Score (Synthetic Accessibility) [1 (Easy) -> 10 (Hard)]
+            if sascorer:
+                sa = sascorer.calculateScore(self.mol)
+                # Normalize: We want low SA. 
+                # If SA > 5 (Hard), penalize. If SA < 3 (Easy), reward.
+                reward -= (sa - 3.0) * 0.3 
 
-            # Molecular Weight: Target < 500
+            # Molecular Weight (Target: 200-500 Da)
             mw = Descriptors.MolWt(self.mol)
-            if mw < 500:
-                reward += 1.0
-            else:
-                reward -= 0.01 * (mw - 500) # Penalize just adding Carbon infinetely
-
-        except Exception as e:
-            # If RDKit descriptors crash for any other reason
-            print(f"Descriptor calculation failed: {e}")
-            reward -= 1.0
+            if mw < 200: reward -= 0.5 # Too small
+            elif mw > 500: reward -= 0.5 # Too big
+            else: reward += 1.0 # Sweet spot
 
         rewards = {agent: reward for agent in self.agents}
 
@@ -181,15 +210,55 @@ class DrugDesignEnv(ParallelEnv):
 
     
     def observe(self, agent):
-        try:
-            self.mol.UpdatePropertyCache(strict=False)
-            mol = self.mol.GetMol()
-            Chem.SanitizeMol(mol)
-            fp = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048).GetFingerprintAsNumPy(mol)
-            return fp.astype(np.float32)
-        except:
-            # Fallback for invalid/empty molecules
-            return np.zeros((2048,), dtype=np.float32)
+        self.mol.UpdatePropertyCache(strict=False)
+        mol = self.mol.GetMol()
+        
+        # Init Empty Arrays (Padding with Zeros)
+        x = np.zeros((self.MAX_ATOMS, self.NUM_ATOM_FEATURES), dtype=np.float32)
+        mask = np.zeros((self.MAX_ATOMS,), dtype=np.int8)
+        
+        # Max edges = Max_Atoms * 4 (heuristic for space allocation)
+        max_edges = self.MAX_ATOMS * 4 
+        edge_index = np.full((2, max_edges), -1, dtype=np.int64) # Fill with -1 for empty
+        edge_attr = np.zeros((max_edges, self.NUM_BOND_FEATURES), dtype=np.float32)
+
+        # Fill Node Features
+        num_atoms = mol.GetNumAtoms()
+        for i, atom in enumerate(mol.GetAtoms()):
+            if i >= self.MAX_ATOMS: break
+            x[i] = self._get_atom_features(atom)
+            mask[i] = 1 # Mark this node as real
+
+        # Fill Edge Features (Adjacency)
+        edge_count = 0
+        for bond in mol.GetBonds():
+            if edge_count >= max_edges: break
+            
+            idx1 = bond.GetBeginAtomIdx()
+            idx2 = bond.GetEndAtomIdx()
+            
+            # Add edge (u, v)
+            edge_index[0, edge_count] = idx1
+            edge_index[1, edge_count] = idx2
+            edge_attr[edge_count] = self._get_bond_features(bond)
+            edge_count += 1
+
+            # Since graphs are undirected in GNNs usually, we add (v, u) as well
+            if edge_count < max_edges:
+                edge_index[0, edge_count] = idx2
+                edge_index[1, edge_count] = idx1
+                edge_attr[edge_count] = self._get_bond_features(bond)
+                edge_count += 1
+        
+        action_mask = self._get_action_mask() # Get the mask
+        
+        return {
+            "x": x,
+            "edge_index": edge_index,
+            "edge_attr": edge_attr,
+            "mask": mask,
+            "action_mask": action_mask
+        }
     
     def _add_atom(self, atom_symbol):
         """Add a new atom bonded to random existing atom with free valence."""
@@ -258,6 +327,92 @@ class DrugDesignEnv(ParallelEnv):
     def _do_nothing(self):
         """Do nothing."""
         pass
+    def _get_atom_features(self, atom):
+        """
+        Converts an RDKit atom into a feature vector.
+        Features: [Atom Type (One-Hot), Is_Aromatic, Hybridization]
+        """
+        # Atom Type One-Hot (C, N, O, F, S, Cl, Other)
+        possible_atoms = ['C', 'N', 'O', 'F', 'S', 'Cl']
+        atom_type = [0] * (len(possible_atoms) + 1)
+        symbol = atom.GetSymbol()
+        if symbol in possible_atoms:
+            atom_type[possible_atoms.index(symbol)] = 1
+        else:
+            atom_type[-1] = 1 # 'Other' category
+
+        # Properties
+        is_aromatic = [1 if atom.GetIsAromatic() else 0]
+        
+        # Hybridization (SP, SP2, SP3, Other)
+        hybridization = [0] * 4
+        hyb = str(atom.GetHybridization())
+        if 'SP3' in hyb: hybridization[0] = 1
+        elif 'SP2' in hyb: hybridization[1] = 1
+        elif 'SP' in hyb: hybridization[2] = 1
+        else: hybridization[3] = 1
+
+        return np.array(atom_type + is_aromatic + hybridization, dtype=np.float32)
+
+    def _get_bond_features(self, bond):
+        """
+        Converts an RDKit bond into a feature vector.
+        Features: [Bond Type (Single, Double, Triple, Aromatic)]
+        """
+        bond_type = bond.GetBondType()
+        features = [0] * 4
+        if bond_type == BondType.SINGLE: features[0] = 1
+        elif bond_type == BondType.DOUBLE: features[1] = 1
+        elif bond_type == BondType.TRIPLE: features[2] = 1
+        elif bond_type == BondType.AROMATIC: features[3] = 1
+        return np.array(features, dtype=np.float32)
+    
+    def _check_unwanted_substructures(self, mol):
+        """Rejects molecules with unstable/toxic motifs (e.g. N-Cl, O-O, N-N)."""
+
+        # Reject N-Cl (Chloramines - Unstable/Explosive)
+        if mol.HasSubstructMatch(MolFromSmarts('[N]-[Cl]')): return False
+        if mol.HasSubstructMatch(MolFromSmarts('[N]-[F]')): return False
+        
+        # Reject Peroxides (O-O) - Explosive
+        if mol.HasSubstructMatch(MolFromSmarts('[O]-[O]')): return False
+
+        # Reject Long Chains (>7 Carbons in a row without branching/heteroatoms)
+        # Helps prevent "greasy" nondrugs
+        if mol.HasSubstructMatch(MolFromSmarts('CCCCCCCC')): return False
+        
+        return True
+
+    def _get_action_mask(self):
+        """
+        Returns a boolean mask of valid actions [1, 0, 1, ...]
+        Size = 11 (Action Space Size)
+        """
+        mask = np.ones(11, dtype=np.int8)
+        
+        # Cannot add atoms if we hit the limit
+        if self.mol.GetNumAtoms() >= self.MAX_ATOMS:
+            mask[0:6] = 0 # Disable Adding Atoms (Actions 0-5)
+            mask[9] = 0   # Disable Adding Ring
+            
+        # Cannot add bonds if < 2 atoms
+        if self.mol.GetNumAtoms() < 2:
+            mask[6:9] = 0 # Disable Adding Bonds (Actions 6-8)
+
+        # Check valences for specific atom types
+        # If ALL current atoms are full, we can't add a bond!
+        has_free_valence = False
+        for atom in self.mol.GetAtoms():
+            if self._get_free_valence(atom) > 0:
+                has_free_valence = True
+                break
+        
+        if not has_free_valence:
+            mask[6:9] = 0 # Disable Bonds if everyone is full
+            # Also effectively disables adding atoms because they need a bond site
+            # But we leave it "open" so the agent learns to fail
+
+        return mask
     
     def render(self):
         """

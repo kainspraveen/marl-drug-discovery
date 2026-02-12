@@ -1,11 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-import pandas as pd  # <--- NEW: For saving CSV
-import os
+import pandas as pd
 from torch_geometric.data import Data, Batch
-from rdkit import Chem # <--- NEW: For converting Mol to SMILES
+from rdkit import Chem
 from env.drug_env import DrugDesignEnv
 from gnn_agent import GNNActorCritic
 
@@ -14,7 +12,7 @@ LR = 0.002
 GAMMA = 0.99
 EPS_CLIP = 0.2
 K_EPOCHS = 4
-UPDATE_TIMESTEP = 2000 # Increased slightly for stability
+UPDATE_TIMESTEP = 2000
 MAX_EPISODES = 5000
 
 class PPOAgent:
@@ -49,8 +47,7 @@ class PPOAgent:
         return batch, action_mask
 
     def update(self, memory):
-        # ... (Same update logic as before) ...
-        # Convert list to tensor
+        # Monte Carlo estimate of rewards
         rewards = []
         discounted_reward = 0
         for reward, is_terminal in zip(reversed(memory.rewards), reversed(memory.is_terminals)):
@@ -120,34 +117,45 @@ def train():
     agent = PPOAgent()
     memory = Memory()
     
-    # === NEW: Tracking Best Molecules ===
     best_molecules = []
     output_file = "best_molecules.csv"
     
     print(f"Starting training for {MAX_EPISODES} episodes...")
     
+    # HARDCODED ORDER to ensure strategy works as intended
+    # 1. Scaffold (Builds Carbon)
+    # 2. Functional (Adds N/O)
+    # 3. Finetune (Adds Cl/F or Caps)
+    agent_cycle = ["scaffold", "functional", "finetune"]
+    
     timestep = 0
     
     for i_episode in range(1, MAX_EPISODES+1):
         observations, _ = agent.env.reset()
-        curr_agent = "affinity"
-        state_batch, action_mask = agent.convert_obs_to_graph(observations[curr_agent])
         ep_reward = 0
         
         for t in range(50):
             timestep += 1
             
-            # Run Policy
+            # 1. Select which agent acts this turn
+            curr_agent = agent_cycle[t % 3] 
+            
+            # 2. Get that agent's specific observation (with their specific Action Mask)
+            # observation dictionary is updated after every step, so this is always fresh
+            state_batch, action_mask = agent.convert_obs_to_graph(observations[curr_agent])
+            
+            # 3. Run Policy
             action, log_prob, _, val = agent.policy_old.get_action(state_batch.x, state_batch.edge_index, state_batch.batch, action_mask)
             
-            # Step Env
+            # 4. Step Env
             actions = {curr_agent: action.item()}
             obs, rewards, terminations, truncations, _ = agent.env.step(actions)
             
+            # 5. Get Reward & Done for the current agent
             reward = rewards[curr_agent]
             done = terminations[curr_agent] or truncations[curr_agent]
             
-            # Store in memory
+            # 6. Store in memory
             memory.states.append(state_batch)
             memory.actions.append(action)
             memory.logprobs.append(log_prob)
@@ -155,12 +163,13 @@ def train():
             memory.is_terminals.append(done)
             memory.masks.append(action_mask)
             
-            # Update state
-            state_batch, action_mask = agent.convert_obs_to_graph(obs[curr_agent])
+            # 7. Update Loop Variables
+            observations = obs # Update observations for the next turn
             ep_reward += reward
             
             # Update PPO
             if timestep % UPDATE_TIMESTEP == 0:
+                print(f"   [UPDATE] Updating PPO Policy at timestep {timestep}...")
                 agent.update(memory)
                 memory.clear_memory()
                 timestep = 0
@@ -168,12 +177,12 @@ def train():
             if done:
                 break
         
-        # === NEW: Save if Reward is Positive ===
+        # Save results (Only if positive reward)
         if ep_reward > 0.0:
             smiles = Chem.MolToSmiles(agent.env.mol)
             best_molecules.append({"Episode": i_episode, "SMILES": smiles, "Reward": ep_reward})
             
-            # Save to CSV every 10 successes (to avoid slow disk I/O)
+            # Save strictly every 10 successful molecules
             if len(best_molecules) % 10 == 0:
                 df = pd.DataFrame(best_molecules)
                 df.to_csv(output_file, index=False)
@@ -181,11 +190,12 @@ def train():
 
         # Logging
         if i_episode % 10 == 0:
-            print(f"Episode {i_episode}\t Last Reward: {ep_reward:.2f}")
+            print(f"Episode {i_episode}\t Total Reward: {ep_reward:.2f} \t Steps: {t+1}")
+            
             if i_episode % 50 == 0:
-                agent.env.render() # Saves image
+                agent.env.render() 
+                # Force save just in case
                 if len(best_molecules) > 0:
-                     # Save latest version just in case
                     df = pd.DataFrame(best_molecules)
                     df.to_csv(output_file, index=False)
 

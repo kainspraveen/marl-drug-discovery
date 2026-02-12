@@ -42,7 +42,6 @@ class GNNActorCritic(nn.Module):
 
         # 2. Global Pooling (Readout)
         # Aggregates all atoms in a molecule into a single vector
-        # x shape becomes: [Batch_Size, Hidden_Dim]
         x = global_mean_pool(x, batch_vector)
         
         # 3. Shared Processing

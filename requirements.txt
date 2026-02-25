@@ -14,9 +14,17 @@ pettingzoo
 
 # Chemistry / molecule building
 rdkit
+selfies
 
 # Deep learning
-torch
+torch>=2.0.0
+
+# LLM / Transformers / Fine-tuning
+transformers>=4.50.0
+datasets>=2.18.0
+accelerate>=0.27.0
+peft>=0.10.0
+sentencepiece
 
 # Quality-of-life (highly recommended)
 tqdm

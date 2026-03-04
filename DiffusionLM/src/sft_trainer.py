@@ -59,9 +59,8 @@ from verl.utils.torch_functional import get_cosine_schedule_with_warmup
 from verl.utils.tracking import Tracking
 # from verl.workers.sharding_manager import FSDPUlyssesShardingManager
 
-# from src.diffllm.gen_utils import q_sample
-# from src.trainer.sft_dataset import SFTDataset, TokenizedSFTDataset
-
+from gen_utils import q_sample
+from sft_dataset import SFTDataset, TokenizedSFTDataset
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
 
@@ -820,17 +819,25 @@ class FSDPSFTTrainer(object):
                     shift_labels = shift_labels.to(shift_logits.device)
                     loss = loss_fct(shift_logits, shift_labels)
 
+                    # Clip individual losses to prevent extreme values (key fix for Instruct models)
+                    max_loss_value = getattr(self.config.diffusion, "max_loss_value", 100.0)
+                    loss = torch.clamp(loss, max=max_loss_value)
+
                     loss_mask = loss_mask.to(loss.device)
                     loss = loss.masked_fill(~loss_mask, 0)
                     if self.config.diffusion.token_reweighting:
+                        # Clamp intermediate values to prevent NaN from exp overflow
+                        clamped_loss = torch.clamp(loss, max=20.0)  # exp(-20) is safe
                         loss = (
                             self.config.diffusion.alpha
-                            * (1 - torch.exp(-loss)) ** self.config.diffusion.gamma
+                            * (1 - torch.exp(-clamped_loss)) ** self.config.diffusion.gamma
                             * loss
                         )
 
                     if self.config.diffusion.time_reweighting == "original":
-                        weight = 1 / t[:, None].float().expand(labels.size())
+                        # Clamp t to avoid division by very small values
+                        t_clamped = torch.clamp(t, min=0.01)
+                        weight = 1 / t_clamped[:, None].float().expand(labels.size())
                     elif self.config.diffusion.time_reweighting == "linear":
                         weight = 1 - t[:, None].float().expand(labels.size())
                     elif self.config.diffusion.time_reweighting == "cart":
@@ -856,6 +863,9 @@ class FSDPSFTTrainer(object):
                         )
 
                     loss = loss * weight.reshape(-1)
+                    
+                    # Replace any NaN/Inf values in per-token loss with zero
+                    loss = torch.where(torch.isfinite(loss), loss, torch.zeros_like(loss))
                 else:
                     raise NotImplementedError(
                         "Sequence parallel is not implemented yet"
@@ -865,6 +875,13 @@ class FSDPSFTTrainer(object):
 
                 valid_token_this_rank = torch.clamp(valid_token_this_rank, min=1)
                 loss = torch.sum(loss) / valid_token_this_rank
+                
+                # Final NaN check - if loss is still NaN/Inf, replace with zero and skip backward
+                if not torch.isfinite(loss):
+                    if self.device_mesh.get_rank() == 0:
+                        logger.warning("NaN/Inf loss detected, skipping this batch")
+                    loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype, requires_grad=True)
+                    return loss
 
                 if do_backward:
                     loss.backward()
@@ -882,17 +899,54 @@ class FSDPSFTTrainer(object):
         micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
         n_micro_batches = len(micro_batches)
         step_loss = 0
+        nan_batch = False
         for micro_batch in micro_batches:
             loss = (
                 self._compute_loss_and_backward(batch=micro_batch, do_backward=False)
                 / n_micro_batches
             )
+            # Check for NaN loss before backward
+            if not torch.isfinite(loss):
+                nan_batch = True
+                if self.device_mesh.get_rank() == 0:
+                    logger.warning("NaN loss in micro-batch, skipping backward")
+                continue
             loss.backward()
             step_loss += loss.item()
+        
+        # Skip optimizer step if we had NaN in this batch
+        if nan_batch and step_loss == 0:
+            if self.device_mesh.get_rank() == 0:
+                logger.warning("All micro-batches had NaN loss, skipping optimizer step")
+            self.optimizer.zero_grad()
+            self.lr_scheduler.step()
+            return {
+                "train/loss": float('nan'),
+                "train/lr(1e-3)": self.lr_scheduler.get_last_lr()[0] * 1e3,
+                "train/grad_norm": float('nan'),
+                "train/num_eos_mean": 0.0,
+                "train/num_eos_max": 0.0,
+                "train/nan_batch": 1.0,
+            }
 
         grad_norm = self.fsdp_model.clip_grad_norm_(
             max_norm=self.config.optim.clip_grad
         )
+        
+        # Check for NaN gradients and skip step if found
+        if not torch.isfinite(grad_norm):
+            if self.device_mesh.get_rank() == 0:
+                logger.warning("NaN gradient norm detected, skipping optimizer step")
+            self.optimizer.zero_grad()
+            self.lr_scheduler.step()
+            return {
+                "train/loss": step_loss,
+                "train/lr(1e-3)": self.lr_scheduler.get_last_lr()[0] * 1e3,
+                "train/grad_norm": float('nan'),
+                "train/num_eos_mean": 0.0,
+                "train/num_eos_max": 0.0,
+                "train/nan_grad": 1.0,
+            }
 
         log_gpu_memory_usage("Before optimizer step", logger=logger)
 

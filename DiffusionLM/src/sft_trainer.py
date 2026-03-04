@@ -59,8 +59,8 @@ from verl.utils.torch_functional import get_cosine_schedule_with_warmup
 from verl.utils.tracking import Tracking
 # from verl.workers.sharding_manager import FSDPUlyssesShardingManager
 
-from gen_utils import q_sample
-from sft_dataset import SFTDataset, TokenizedSFTDataset
+from DiffusionLM.src.gen_utils import q_sample
+from DiffusionLM.src.sft_dataset import SFTDataset, TokenizedSFTDataset
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
 
